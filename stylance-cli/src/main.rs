@@ -14,8 +14,10 @@ use tokio_stream::{Stream, StreamExt};
 #[derive(Parser)]
 #[command(author, version, about, long_about = None, arg_required_else_help = true)]
 struct Cli {
-    /// The path where your crate's Cargo toml is located
-    manifest_dir: PathBuf,
+    /// The path(s) where your crate's Cargo toml is located.
+    /// Multiple paths can be specified to process several crates at once.
+    #[arg(required = true)]
+    manifest_dirs: Vec<PathBuf>,
 
     /// Generate a file with all css modules concatenated
     #[arg(long)]
@@ -45,39 +47,60 @@ struct RunParams {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let run_params = make_run_params(&cli).await?;
+    let all_params = make_all_run_params(&cli).await?;
 
-    run(&run_params.manifest_dir, &run_params.config)?;
+    for params in &all_params {
+        run(&params.manifest_dir, &params.config)?;
+    }
 
     if cli.watch {
-        watch(cli, run_params).await?;
+        // Spawn one independent watch task per manifest dir, as each crate
+        // has its own config, folders, and output.
+        let mut handles = Vec::new();
+        for params in all_params {
+            let handle = tokio::spawn(watch_single(params));
+            handles.push(handle);
+        }
+
+        // Wait for all watchers (they run forever unless an error occurs).
+        for handle in handles {
+            handle.await??;
+        }
     }
 
     Ok(())
 }
 
-async fn make_run_params(cli: &Cli) -> anyhow::Result<RunParams> {
-    let manifest_dir = cli.manifest_dir.clone();
-    let mut config = spawn_blocking(move || load_config(&manifest_dir)).await??;
+async fn make_all_run_params(cli: &Cli) -> anyhow::Result<Vec<RunParams>> {
+    let mut all = Vec::new();
+    for manifest_dir in &cli.manifest_dirs {
+        all.push(make_run_params(cli, manifest_dir).await?);
+    }
+    Ok(all)
+}
+
+async fn make_run_params(cli: &Cli, manifest_dir: &PathBuf) -> anyhow::Result<RunParams> {
+    let manifest_dir_clone = manifest_dir.clone();
+    let mut config = spawn_blocking(move || load_config(&manifest_dir_clone)).await??;
 
     config.output_file = cli.output_file.clone().or_else(|| {
         config
             .output_file
             .as_ref()
-            .map(|p| cli.manifest_dir.join(p))
+            .map(|p| manifest_dir.join(p))
     });
 
     config.output_dir = cli
         .output_dir
         .clone()
-        .or_else(|| config.output_dir.as_ref().map(|p| cli.manifest_dir.join(p)));
+        .or_else(|| config.output_dir.as_ref().map(|p| manifest_dir.join(p)));
 
     if !cli.folder.is_empty() {
         config.folders.clone_from(&cli.folder);
     }
 
     Ok(RunParams {
-        manifest_dir: cli.manifest_dir.clone(),
+        manifest_dir: manifest_dir.clone(),
         config,
     })
 }
@@ -157,21 +180,33 @@ async fn debounced_next(s: &mut (impl Stream<Item = ()> + Unpin)) -> Option<()> 
     }
 }
 
-async fn watch(cli: Cli, run_params: RunParams) -> anyhow::Result<()> {
+/// Watch a single manifest dir independently. Each crate gets its own
+/// watcher, config reload, and run loop — a change in one crate only
+/// triggers a rebuild for that crate.
+async fn watch_single(run_params: RunParams) -> anyhow::Result<()> {
+    let manifest_dir = run_params.manifest_dir.clone();
     let (run_params_tx, mut run_params) = tokio::sync::watch::channel(Arc::new(run_params));
-
-    let manifest_dir = cli.manifest_dir.clone();
 
     // Watch Cargo.toml to update the current run_params.
     let cargo_toml_events = watch_file(&manifest_dir.join("Cargo.toml").canonicalize()?)?;
+    let manifest_dir_clone = manifest_dir.clone();
     tokio::spawn(async move {
         let mut stream = tokio_stream::wrappers::UnboundedReceiverStream::new(cargo_toml_events);
         while debounced_next(&mut stream).await.is_some() {
-            match make_run_params(&cli).await {
-                Ok(new_params) => {
+            let manifest_dir = manifest_dir_clone.clone();
+            let config = spawn_blocking(move || load_config(&manifest_dir)).await;
+            match config {
+                Ok(Ok(config)) => {
+                    let new_params = RunParams {
+                        manifest_dir: manifest_dir_clone.clone(),
+                        config,
+                    };
                     if run_params_tx.send(Arc::new(new_params)).is_err() {
                         return;
                     };
+                }
+                Ok(Err(e)) => {
+                    eprintln!("{e}");
                 }
                 Err(e) => {
                     eprintln!("{e}");
